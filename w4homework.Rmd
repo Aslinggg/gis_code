@@ -1,0 +1,203 @@
+---
+title: "Week 4 Gender Inequality Index 2010–2019"
+author: "Asling"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    self_contained: true
+---
+
+## 任务与差值定义
+
+读取 UNDP HDR 2025 的同一版时间序列，提取 `gii_2010` 和 `gii_2019`，
+连接指定的 Esri 世界边界，计算 `gii_change_2019_minus_2010 = gii_2019 - gii_2010`。
+负值表示不平等下降，正值表示上升。差值单位是指数点。
+原始文件已随项目保存，直接 Knit 可以离线完成数据处理。
+
+## 加载包
+
+首次使用时在 Console 安装：
+`install.packages(c("sf", "tidyverse", "countrycode", "knitr"))`。
+
+```{r setup, message=FALSE, warning=FALSE}
+library(sf)
+library(tidyverse)
+library(countrycode)
+knitr::opts_chunk$set(echo = TRUE)
+dir.create("results", showWarnings = FALSE)
+```
+
+1. 使用 sf 读取边界、tidyverse 连接数据、countrycode 转换国家代码。
+2. 本 Rmd 放在 week4_gii 内，data 和 results 相对于此文件定位。
+
+## 读取数据并筛选国家记录
+
+```{r read-data}
+hdr <- readr::read_csv(
+  "data/HDR25_Composite_indices_complete_time_series.csv",
+  locale = locale(encoding = "ISO-8859-1"),
+  na = c("", "NA", ".."), show_col_types = FALSE
+)
+stopifnot(all(c("iso3", "country", "gii_2010", "gii_2019") %in% names(hdr)))
+
+gii <- hdr %>%
+  filter(str_detect(iso3, "^[A-Z]{3}$")) %>%
+  transmute(
+    iso3,
+    undp_country = country,
+    gii_2010 = as.numeric(gii_2010),
+    gii_2019 = as.numeric(gii_2019),
+    gii_change_2019_minus_2010 = round(gii_2019 - gii_2010, 3)
+  )
+
+stopifnot(!anyDuplicated(gii$iso3))
+stopifnot(all(gii$gii_2010 >= 0 & gii$gii_2010 <= 1, na.rm = TRUE))
+stopifnot(all(gii$gii_2019 >= 0 & gii$gii_2019 <= 1, na.rm = TRUE))
+```
+
+1. 原 CSV 使用 Latin-1 编码。
+2. 保留三字母国家代码，排除11条世界、区域与发展组别汇总。
+3. 两个年份均取自同一版数据。缺失年份保持 NA，差值也为 NA。
+4. 对右表国家代码做唯一性检查，防止连接后意外增加行数。
+
+## 读取边界并统一国家代码
+
+```{r read-world}
+world <- st_read("data/world_countries.geojson", quiet = TRUE)
+names(world) <- tolower(names(world))
+stopifnot(all(c("country", "iso") %in% names(world)))
+world$iso <- as.character(world$iso)
+
+world <- world %>%
+  transmute(
+    world_country = country,
+    iso2 = iso,
+    iso3 = countrycode(iso, origin = "iso2c", destination = "iso3c")
+  )
+stopifnot(!anyNA(world$iso3))
+
+# 用下载时保存的 countrycode 字典复核转换
+dict <- readr::read_csv(
+  "data/countrycode_dictionary.csv",
+  na = "", show_col_types = FALSE
+) %>%
+  filter(!is.na(iso2c), !is.na(iso3c)) %>%
+  distinct(iso2c, iso3c)
+stopifnot(!anyDuplicated(dict$iso2c))
+expected_iso3 <- dict$iso3c[match(world$iso2, dict$iso2c)]
+stopifnot(identical(as.character(world$iso3), as.character(expected_iso3)))
+```
+
+1. Esri 的 ISO 字段为两位代码，UNDP 的 iso3 为三位代码。
+2. 使用每个要素自身 ISO，保留领地的单独身份。
+3. Namibia 的两位代码是字符串 "NA"，字典读取用 na = ""，保留该代码。
+4. 边界含251个要素、244个不同ISO3。葡萄牙、西班牙等有分开存储的岛屿要素。
+
+## 左连接并标记缺失
+
+```{r join}
+world_gii <- world %>%
+  left_join(gii, by = "iso3", relationship = "many-to-one") %>%
+  mutate(
+    data_status = case_when(
+      is.na(undp_country) ~ "no_undp_record",
+      is.na(gii_2010) | is.na(gii_2019) ~ "missing_gii_year",
+      TRUE ~ "complete"
+    ),
+    interpretation = case_when(
+      data_status != "complete" ~ "No comparable data",
+      gii_change_2019_minus_2010 < 0 ~ "Lower inequality",
+      gii_change_2019_minus_2010 > 0 ~ "Higher inequality",
+      TRUE ~ "No change at published precision"
+    )
+  )
+
+stopifnot(nrow(world_gii) == nrow(world))
+stopifnot(all(abs(
+  world_gii$gii_change_2019_minus_2010 -
+    (world_gii$gii_2019 - world_gii$gii_2010)
+) < 1e-10, na.rm = TRUE))
+```
+
+1. left_join 保留全部世界边界要素。
+2. many-to-one 允许同一国家有多个岛屿要素，但只匹配一条UNDP记录。
+3. 缺失值分为无UNDP国家记录、国家记录存在但某年GII缺失。
+
+## 汇总与核对
+
+```{r summary}
+countries <- world_gii %>% st_drop_geometry() %>% distinct(iso3, .keep_all = TRUE)
+comparable <- countries %>% filter(data_status == "complete")
+
+checks <- tibble(
+  check = c("World geometry features", "Unique ISO3 codes",
+            "Matched UNDP country records", "Comparable country records",
+            "Lower inequality", "Higher inequality", "No change",
+            "No UNDP country record", "Matched but missing a GII year"),
+  value = c(nrow(world_gii), nrow(countries),
+            sum(!is.na(countries$undp_country)), nrow(comparable),
+            sum(comparable$gii_change_2019_minus_2010 < 0),
+            sum(comparable$gii_change_2019_minus_2010 > 0),
+            sum(comparable$gii_change_2019_minus_2010 == 0),
+            sum(countries$data_status == "no_undp_record"),
+            sum(countries$data_status == "missing_gii_year"))
+)
+knitr::kable(checks)
+
+examples <- comparable %>%
+  filter(iso3 %in% c("GBR", "CHN", "USA", "NAM")) %>%
+  select(world_country, iso3, gii_2010, gii_2019, gii_change_2019_minus_2010)
+knitr::kable(examples, digits = 3)
+
+mean_change <- mean(comparable$gii_change_2019_minus_2010)
+mean_change
+```
+
+1. 国家级汇总先用 distinct(iso3) 去掉重复岛屿要素。
+2. 固定数据快照应得到154个可比国家记录，其中145个下降、9个上升。
+3. 平均变化约为−0.056，是国家等权均值，不能解释成人口加权全球变化或政策因果效果。
+
+## 导出空间结果和审计文件
+
+```{r export}
+missing_audit <- world_gii %>%
+  st_drop_geometry() %>% filter(data_status != "complete")
+without_boundary <- gii %>% anti_join(st_drop_geometry(world), by = "iso3")
+
+st_write(
+  world_gii, "results/world_gii_change.geojson",
+  driver = "GeoJSON", delete_dsn = TRUE, quiet = TRUE
+)
+write_csv(st_drop_geometry(world_gii), "results/world_gii_change.csv", na = "")
+write_csv(gii, "results/gii_country_values.csv", na = "")
+write_csv(missing_audit, "results/missing_data_audit.csv", na = "")
+write_csv(without_boundary, "results/undp_without_boundary.csv", na = "")
+write_csv(checks, "results/r_validation_summary.csv")
+```
+
+1. GeoJSON 保存边界与新差值列，CSV保存可检查的属性表。
+2. 审计表列出未匹配或缺失值。Hong Kong, China (SAR) 无独立匹配边界，且两年GII都缺失，单独列出。
+3. 字段 gii_change_2019_minus_2010 是本作业要求的新列。
+
+
+
+## 数据来源与限制
+
+- UNDP (2025), Human Development Report 2025 composite indices time series (1990–2023).
+  https://hdr.undp.org/data-center/documentation-and-downloads
+- 字段定义取自随包的 HDR25_Composite_indices_metadata.xlsx，codebook表的gii行。
+- GII定义和方向 https://hdr.undp.org/data-center/thematic-composite-indices/gender-inequality-index
+- World Countries Generalized, Esri / Garmin / CIA / National Geographic Society.
+  https://hub.arcgis.com/datasets/2b93b06dc0dc4e809d3c8db5cb96ba69_0
+- countrycode, Arel-Bundock, Enevoldsen & Yetman (2018), JOSS 3(28), 848.
+  https://doi.org/10.21105/joss.00848
+- 下载日期 2026-11-18。现代边界与2010/2019统计的空间口径可能不同，边界和领地处理见缺失审计表。
+- 数据源保留各自许可，本项目代码不覆盖UNDP或Esri数据的使用条款。
+
+## 运行环境
+
+```{r session}
+sessionInfo()
+```
+
